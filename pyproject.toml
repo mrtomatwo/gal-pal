@@ -1,0 +1,137 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "galpal"
+version = "1.0.0"
+description = "Pull a company Global Address List into personal Outlook contacts via Microsoft Graph."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "Mr. Tomatwo" }]
+keywords = ["outlook", "contacts", "microsoft-graph", "gal", "address-book"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Email :: Address Book",
+    "Topic :: Utilities",
+]
+# Upper bounds matter: msal 2.x and requests 3.x will both bring breaking
+# changes; tqdm 5.x has not landed but follows semver. Floor pins match
+# requirements.txt — keep them in sync.
+dependencies = [
+    "msal>=1.36,<2",
+    "requests>=2.33,<3",
+    "tqdm>=4.67,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff==0.15.12",
+    "pyright==1.1.409",
+    "pytest==9.0.3",
+]
+
+[project.urls]
+Homepage = "https://github.com/mrtomatwo/gal-pal"
+Repository = "https://github.com/mrtomatwo/gal-pal.git"
+Issues = "https://github.com/mrtomatwo/gal-pal/issues"
+
+# End users `pipx install galpal` and invoke `galpal …`. The dev path uses
+# `python dev_galpal.py …` (the wrapper in the repo root); both routes land
+# in `_galpal.cli.main`. The wrapper script is intentionally NOT in the wheel.
+[project.scripts]
+galpal = "_galpal.cli:main"
+
+[tool.setuptools]
+# `dev_galpal.py` is a development shim, not part of the importable package.
+# Only `_galpal/` ships in the wheel.
+packages = ["_galpal", "_galpal.commands"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Quiet the deprecation noise that `msal`/`requests` occasionally emit from
+# transitive deps; failing the suite on those is not in scope for this tool.
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    # Type-annotation enforcement — partially present but not required everywhere
+    "ANN",
+    # Trailing comma & implicit string concat — conflict with ruff formatter
+    "COM812", "ISC001",
+    # pydocstyle: pick one of each incompatible pair (kept: D211, D212)
+    "D203", "D213",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"_galpal/**" = [
+    "T201",    # CLI tool: print IS the UX (progress, summaries, prompts, tqdm coordination)
+    "PLR0913", # filter helpers like _contact_passes_filters legitimately take many keyword-only flags
+]
+"_galpal/graph.py" = [
+    # send_batch's branch / statement counts are the retry-state-machine count
+    # (outer 429 cap, inner 429 cap, 5xx in _retrying_request, partial-response
+    # synthesis, parse-failure synthesis); it's not "many concerns", it's
+    # "many error shapes from one external system, all linear in the same loop".
+    "C901", "PLR0912", "PLR0915",
+]
+"_galpal/cli.py" = [
+    "PLR0911", # main() is a CLI subcommand dispatcher — many returns are clearer than nesting
+    "PLR0915", # main() is mostly argparse subparser registration — 7 subcommands, statement-heavy by nature
+    "PLR0912", # main()'s branch count tracks subcommand count, not concern count
+    "C901",    # main() complexity tracks subcommand count (8 dispatch branches), not concern count
+]
+"_galpal/commands/**" = [
+    # Orchestrator functions (run_audit/run_dedupe/run_prune/run_delete/run_remove_categories)
+    # legitimately do many things in sequence — fetch, filter, render, confirm, mutate.
+    # Splitting them adds layers without clarifying the flow.
+    "C901", "PLR0912", "PLR0915",
+]
+"dev_galpal.py" = [
+    "T201",    # bootstrap subcommand prints status to stdout; that's the UX
+    "PLC0415", # _bootstrap_init imports stdlib lazily so it works without third-party deps installed
+    "S603",    # pip and git paths in init are locally constructed, no untrusted input
+    "S607",    # `git` is invoked from PATH intentionally — same shape used in every git tutorial
+    # _bootstrap_init does many one-off things in sequence (parse argv, preflight,
+    # venv create-or-recreate, pip install, hook config). Splitting them adds
+    # layers without clarifying the flow, and the function isn't called from
+    # anywhere else.
+    "C901", "PLR0912", "PLR0915",
+]
+"tests/**" = [
+    "S101",    # assert statements are fine in tests
+    "ANN",     # no type annotations required in tests
+    "D",       # no docstrings required in tests
+    "PLR2004", # magic values are fine in test assertions
+    "SLF001",  # private member access from tests is expected
+    "FBT003",  # passing bools positionally to fixture builders is fine in tests
+    "ARG001",  # fake HTTP signatures must accept (url, headers, json, params, timeout)
+    "ARG002",  # fake/stub method signatures often have unused args
+    "ARG005",  # unused lambda args in monkeypatched stubs
+    "PT018",   # composite asserts are readable for small test fixtures
+    "ERA001",  # commented section markers (e.g. "# c1: bare") are intentional in test fixtures
+    "PLR0911", # fake HTTP dispatch in conftest legitimately has many short-circuits
+    "PLR0913", # fixture builders (e.g. make_user) take many optional fields by design
+    "PLC0415", # late-imports in tests keep fixtures from depending on import order
+    "C901",    # FakeGraph._dispatch's complexity scales with the route count, not concern count
+]
+
+[tool.pyright]
+pythonVersion = "3.11"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "basic"

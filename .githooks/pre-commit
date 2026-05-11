@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Capture the list of staged files BEFORE any autofix runs.
+# This ensures we only re-stage files that were originally part of the commit,
+# not every modified file in the working tree.
+staged_files=$(git diff --cached --name-only --diff-filter=d)
+
+if [ -z "$staged_files" ]; then
+    echo "No staged files — skipping pre-commit checks."
+    exit 0
+fi
+
+echo "=== pre-commit: ruff format (autofix) ==="
+.venv/bin/ruff format dev_galpal.py _galpal/ tests/
+
+echo "=== pre-commit: ruff check (autofix) ==="
+.venv/bin/ruff check --fix dev_galpal.py _galpal/ tests/
+
+echo "=== pre-commit: re-stage autofixed files ==="
+# Only re-stage files that were originally staged (not the entire working tree)
+echo "$staged_files" | xargs git add --
+
+echo "=== pre-commit: ruff check (validate) ==="
+.venv/bin/ruff check dev_galpal.py _galpal/ tests/
+
+echo "=== pre-commit: ruff format (validate) ==="
+.venv/bin/ruff format --check dev_galpal.py _galpal/ tests/
+
+echo "=== pre-commit: pyright ==="
+.venv/bin/pyright dev_galpal.py _galpal/
+
+echo "=== pre-commit: unit tests ==="
+.venv/bin/python -m pytest tests/test_unit.py -x -q
+
+echo "=== pre-commit: e2e tests ==="
+.venv/bin/python -m pytest tests/test_e2e.py -x -q
+
+echo "=== pre-commit: gitleaks (secret scanning) ==="
+gitleaks git --staged --verbose --redact
+echo "gitleaks: no secrets detected ✓"
+
+echo "=== All checks passed ==="
+# Note: previously this hook ran `pip list --outdated`, which shells out to
+# PyPI on every commit (slow + flaky, and the wrong place for a maintenance
+# nag). Run it manually as needed:  .venv/bin/pip list --outdated
