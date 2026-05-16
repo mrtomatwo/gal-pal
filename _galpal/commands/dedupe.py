@@ -5,15 +5,15 @@ ranks each group by `user_data_score` to pick a winner, and deletes the losers.
 No data is merged from losers into the winner — the winner stays as-is, the rest
 go to Deleted Items.
 
-Memory shape: single streaming pass. Each row's full payload is alive only for
-the duration of one loop iteration; after extracting the metadata we need
-(displayName, score, createdDateTime, emails), the dict goes out of scope and
-Python's GC reclaims it. Persistent state is bounded by `N x small constants`
-(ids + emails + small per-contact tuples) regardless of how big any individual
-contact's `personalNotes` / photo / etc. is. The remaining ceiling is one page's
-worth of contacts during `r.json()` page-parse — bounded by CONTACTS_PAGE_SIZE
-times the max-per-contact-payload. ijson-based truly-row-streaming is the 1.1.0
-fix for that ceiling.
+Memory shape: single streaming pass top-to-bottom. `graph_paged` reads the
+HTTP response with `stream=True` and parses each `value[*]` row incrementally
+via ijson, so the wire-level peak is one contact's payload plus ijson's small
+chunk buffer. Inside this loop, each row's full dict is alive only for the
+duration of one iteration; after extracting the metadata we keep (displayName,
+score, createdDateTime, emails), it goes out of scope and Python's GC reclaims
+it. Persistent state is bounded by `N x small constants` (ids + emails + small
+per-contact tuples) regardless of how big any individual contact's
+`personalNotes` / photo / etc. is.
 """
 
 from __future__ import annotations
@@ -39,12 +39,12 @@ def run_dedupe(token: str, *, apply: bool, reporter: Reporter | None = None) -> 
     """Group personal contacts by shared emails (transitively), keep one per group, optionally delete the rest."""
     rep = reporter or default_reporter()
     rep.info("Loading all contacts...")
-    # `$top` honors the env-tunable CONTACTS_PAGE_SIZE so a user with very
-    # large `personalNotes` can dial down peak per-page memory. The ~12 fields
+    # `$top` honors the env-tunable CONTACTS_PAGE_SIZE so the GET cadence is
+    # configurable, but with ijson row-streaming the page size no longer
+    # dominates peak memory the way it did pre-1.1.0. The ~12 fields
     # `user_data_score` reads aren't pinned via `$select` because Graph 400s
-    # on at least one of them on some tenants (and doesn't say which) — pinning
-    # the right subset would need a tenant-specific investigation pass; left
-    # for 1.1.0 along with the ijson row-streaming refactor.
+    # on at least one of them on some tenants (and doesn't say which) —
+    # pinning the right subset would need a tenant-specific investigation pass.
     params = {"$top": CONTACTS_PAGE_SIZE}
 
     # Union-Find with path-halving + union-by-rank. Without rank, a long chain

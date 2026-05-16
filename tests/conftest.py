@@ -10,6 +10,7 @@ sub-requests")."""
 from __future__ import annotations
 
 import copy
+import json
 import re
 import sys
 from pathlib import Path
@@ -28,7 +29,13 @@ from _galpal import graph as graph_module
 
 
 class FakeResponse:
-    """Stand-in for requests.Response with just the surface galpal uses."""
+    """Stand-in for requests.Response with just the surface galpal uses.
+
+    `iter_content` serializes `json_data` on demand so `graph_paged`'s
+    ijson-based row-streaming sees the same shape it would see from a real
+    Graph response. `close` is a no-op; both methods exist so `stream=True`
+    code paths in `_galpal.graph` work against the fake without special-casing.
+    """
 
     def __init__(self, status_code: int, json_data=None, *, text: str = "", headers=None):
         self.status_code = status_code
@@ -38,6 +45,16 @@ class FakeResponse:
 
     def json(self):
         return self._json
+
+    def iter_content(self, chunk_size: int = 65536):
+        # chunk_size ignored — test bodies fit in a single chunk.
+        _ = chunk_size
+        if self._json is None:
+            return
+        yield json.dumps(self._json).encode("utf-8")
+
+    def close(self):
+        pass
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -117,7 +134,9 @@ class FakeGraph:
 
     # -- HTTP entry points used by monkeypatch -----------------------------
 
-    def get(self, url, headers=None, params=None, timeout=None):
+    def get(self, url, headers=None, params=None, timeout=None, *, stream=False):
+        # stream/timeout absorbed but not actually used by the fake.
+        _ = (headers, timeout, stream)
         self.calls.append(("GET", url, params))
         if (resp := self._maybe_429("GET", url)) is not None:
             return resp

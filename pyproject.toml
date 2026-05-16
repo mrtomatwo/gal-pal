@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "galpal"
-version = "1.0.0"
+version = "1.1.0"
 description = "Pull a company Global Address List into personal Outlook contacts via Microsoft Graph."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -29,6 +29,7 @@ classifiers = [
 # changes; tqdm 5.x has not landed but follows semver. Floor pins match
 # requirements.txt — keep them in sync.
 dependencies = [
+    "ijson>=3.3,<4",
     "msal>=1.36,<2",
     "requests>=2.33,<3",
     "tqdm>=4.67,<5",

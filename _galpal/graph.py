@@ -16,7 +16,9 @@ from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 
+import ijson
 import requests
+from ijson.common import ObjectBuilder
 
 from _galpal.filters import FilterConfig, gal_user_passes
 
@@ -145,6 +147,10 @@ def _retrying_request(method: str, url: str, **kwargs) -> requests.Response:
                 MAX_TRANSIENT_RETRIES,
                 ra,
             )
+            # Release the connection before sleeping. Harmless on the
+            # default (non-streamed) path; required on `stream=True` GETs
+            # to avoid leaking the urllib3 connection back to GC.
+            r.close()
         # Same backoff for both transient-exception and 5xx paths.
         if retry_after_hint is not None:
             wait: float = retry_after_hint
@@ -324,14 +330,59 @@ def fetch_all_user_ids(token: str) -> set[str]:
     return set(iter_all_user_ids(token))
 
 
+class _IterReader:
+    """File-like adapter over an iterable of `bytes` chunks for `ijson.parse`.
+
+    ijson's C backend (yajl2_c) reads via `.read(n)`; only the slower pure-Python
+    backend accepts a raw bytes iterator. We feed it the iterator returned by
+    `requests.Response.iter_content(chunk_size=...)` — that path delivers
+    already-decompressed bytes (gzip/deflate handled by requests), so we don't
+    have to special-case `decode_content=True` on `r.raw` and tests don't have
+    to mirror that attribute.
+    """
+
+    def __init__(self, chunks):
+        self._it = iter(chunks)
+        self._buf = b""
+        self._eof = False
+
+    def read(self, n: int = -1) -> bytes:
+        if n < 0:
+            parts = [self._buf, *self._it]
+            self._buf = b""
+            return b"".join(parts)
+        while len(self._buf) < n and not self._eof:
+            try:
+                self._buf += next(self._it)
+            except StopIteration:
+                self._eof = True
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+
 def graph_paged(token: str, url: str, params: dict | None = None):
     """Yield items from a Graph collection, transparently following @odata.nextLink.
+
+    Truly row-streaming: the response body is read via `requests` `stream=True`
+    and parsed incrementally with `ijson`. Each completed `value[*]` element is
+    yielded as soon as `}` is seen on the wire; the full page is never
+    materialized into a Python dict. Peak memory per page is bounded by one
+    single contact's payload (plus ijson's small chunk buffer), not
+    `CONTACTS_PAGE_SIZE x max-per-contact-payload`.
+
+    The `@odata.nextLink` URL can legally appear before *or* after `value` in
+    the JSON response, so we use `ijson.parse` (SAX-like events) rather than
+    `ijson.items`: that lets us yield each `value.item` as `ObjectBuilder`
+    assembles it AND capture the sibling `@odata.nextLink` from the same
+    forward pass without buffering. Graph today emits `@odata.nextLink` last
+    on `/me/contacts` and earlier on some other endpoints — we don't depend
+    on either.
 
     Retries cover the full transient-failure set: 429 honors `Retry-After`
     (with a per-page cap so a misbehaving server stuck on `Retry-After: 0`
     can't loop forever); 5xx / ConnectionError / Timeout go through
-    `_retrying_request` with exponential backoff. Anything else (4xx, json
-    decode error) propagates.
+    `_retrying_request` with exponential backoff. Anything else (4xx, malformed
+    JSON) propagates.
 
     Defense in depth: the `@odata.nextLink` URL is server-controlled, so we
     refuse to follow it if it points anywhere other than `graph.microsoft.com`.
@@ -340,37 +391,70 @@ def graph_paged(token: str, url: str, params: dict | None = None):
     """
     headers = {"Authorization": f"Bearer {token}"}
     page_429_attempts = 0
-    while url:
-        host = urlparse(url).hostname or ""
+    next_url: str | None = url
+    while next_url:
+        host = urlparse(next_url).hostname or ""
         if host not in GRAPH_HOSTS:
             msg = f"refusing to follow @odata.nextLink to non-Graph host {host!r}"
             raise ValueError(msg)
-        r = _retrying_request("GET", url, headers=headers, params=params, timeout=HTTP_TIMEOUT_S)
+        # `stream=True` defers body read so ijson can pull bytes off the wire
+        # as needed. The `try/finally` releases the connection deterministically
+        # — without it, an early generator close (e.g. caller breaks out of
+        # the loop) would leak the underlying urllib3 connection until GC.
+        r = _retrying_request(
+            "GET",
+            next_url,
+            headers=headers,
+            params=params,
+            timeout=HTTP_TIMEOUT_S,
+            stream=True,
+        )
         params = None  # only on the first call; @odata.nextLink already carries them
-        if r.status_code == HTTP_TOO_MANY_REQUESTS:
-            page_429_attempts += 1
-            if page_429_attempts >= MAX_BATCH_429_RETRIES:
-                # Sustained per-page throttling — surface as HTTPError rather
-                # than loop forever. The cap reuses MAX_BATCH_429_RETRIES
-                # because the underlying behavior (server tells us to wait,
-                # we wait, server tells us to wait again) is the same shape.
-                log.warning("graph GET %s: 429 exhausted retry budget", url)
-                r.raise_for_status()
-                return  # pragma: no cover -- raise_for_status raises on 429
-            wait = _parse_retry_after(r.headers.get("Retry-After"))
-            log.info(
-                "graph GET %s: 429, sleeping %ds (retry %d/%d)",
-                url,
-                wait,
-                page_429_attempts,
-                MAX_BATCH_429_RETRIES,
-            )
-            time.sleep(wait)
-            continue
-        r.raise_for_status()
-        body = r.json()
-        yield from body.get("value", [])
-        url = body.get("@odata.nextLink")
+        try:
+            if r.status_code == HTTP_TOO_MANY_REQUESTS:
+                page_429_attempts += 1
+                if page_429_attempts >= MAX_BATCH_429_RETRIES:
+                    # Sustained per-page throttling — surface as HTTPError rather
+                    # than loop forever. The cap reuses MAX_BATCH_429_RETRIES
+                    # because the underlying behavior (server tells us to wait,
+                    # we wait, server tells us to wait again) is the same shape.
+                    log.warning("graph GET %s: 429 exhausted retry budget", next_url)
+                    r.raise_for_status()
+                    return  # pragma: no cover -- raise_for_status raises on 429
+                wait = _parse_retry_after(r.headers.get("Retry-After"))
+                log.info(
+                    "graph GET %s: 429, sleeping %ds (retry %d/%d)",
+                    next_url,
+                    wait,
+                    page_429_attempts,
+                    MAX_BATCH_429_RETRIES,
+                )
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            next_link: str | None = None
+            builder: ObjectBuilder | None = None
+            # `iter_content` over `stream=True` gives us a bytes iterator that
+            # requests has already decompressed (gzip/deflate). We wrap it in a
+            # `.read`-shaped adapter because ijson's fast C backend reads via
+            # `.read(n)`; passing the iterator directly only works in the slow
+            # pure-Python backend and silently degrades performance.
+            for prefix, event, value in ijson.parse(_IterReader(r.iter_content(chunk_size=65536))):
+                if builder is not None:
+                    builder.event(event, value)
+                    if prefix == "value.item" and event == "end_map":
+                        # ObjectBuilder sets `.value` lazily inside `event()` once
+                        # the root object closes; ijson's stubs don't expose it.
+                        yield builder.value  # pyright: ignore[reportAttributeAccessIssue]
+                        builder = None
+                elif prefix == "value.item" and event == "start_map":
+                    builder = ObjectBuilder()
+                    builder.event(event, value)
+                elif prefix == "@odata.nextLink" and event == "string":
+                    next_link = value
+            next_url = next_link
+        finally:
+            r.close()
 
 
 def chunked_batch(

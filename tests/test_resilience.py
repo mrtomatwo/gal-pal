@@ -68,6 +68,44 @@ def test_graph_paged_follows_next_link(graph):
     assert len(user_calls) == 3
 
 
+def test_graph_paged_handles_next_link_before_value(graph, monkeypatch):
+    """`@odata.nextLink` can legally appear before *or* after `value` in the
+    JSON response. The pre-ijson `r.json()` shape didn't care about key order;
+    the row-streaming forward-pass parser does, so this is a real regression
+    point. Drive the order-flipped shape directly and verify both pages still
+    chain correctly."""
+    calls = {"n": 0}
+
+    class ReorderedResponse(FakeResponse):
+        def iter_content(self, chunk_size=65536):
+            yield self._raw
+
+    def reorder_get(url, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # @odata.nextLink before value on purpose.
+            body = (
+                b'{"@odata.nextLink":"'
+                + f"{graph_mod.GRAPH}/users?page=2".encode()
+                + b'","value":[{"id":"u1","userType":"Member","displayName":"a",'
+                b'"mail":"a@x.com","userPrincipalName":"a@x.com"}]}'
+            )
+        else:
+            # Final page: no @odata.nextLink, value last.
+            body = (
+                b'{"value":[{"id":"u2","userType":"Member","displayName":"b",'
+                b'"mail":"b@x.com","userPrincipalName":"b@x.com"}]}'
+            )
+        r = ReorderedResponse(200, None)
+        r._raw = body
+        return r
+
+    monkeypatch.setattr("_galpal.graph.requests.get", reorder_get)
+    out = list(graph_mod.fetch_gal("t", FilterConfig()))
+    assert [u["id"] for u in out] == ["u1", "u2"]
+    assert calls["n"] == 2
+
+
 def test_graph_paged_drops_initial_params_after_first_page(graph):
     """`@odata.nextLink` already encodes every parameter from the original GET, so
     `graph_paged` zeroes out `params` after the first call. Verify by checking

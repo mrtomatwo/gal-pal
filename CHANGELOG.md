@@ -2,9 +2,12 @@
 
 All notable changes to galpal are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 1.1.0 plan
+## [1.1.0] — row-streaming GET
 
-- **ijson-based row-streaming for `graph_paged`.** Today `r.json()` materializes a whole page (CONTACTS_PAGE_SIZE × max-per-contact-payload) into RAM during page parse — fine for typical mailboxes, the remaining OOM ceiling for users with megabyte-sized `personalNotes` / large attachments. Switching to `ijson` makes the GET path truly one-row-at-a-time on the wire. Estimated half-session refactor with three known gotchas: `@odata.nextLink` placement in the response, `requests.Session` connection-lifetime under `stream=True`, and FakeResponse fixture changes. Tracked separately so 1.0.0 can ship without the new dep.
+- **ijson-based row-streaming for `graph_paged`.** `r.json()` previously materialized a whole page (`CONTACTS_PAGE_SIZE × max-per-contact-payload`) into RAM during page parse — the last remaining OOM ceiling for users with megabyte-sized `personalNotes` or large attachments. The GET path now reads the response body via `requests` `stream=True` and parses incrementally with `ijson`, yielding each `value[*]` element as soon as its closing `}` is seen on the wire. Peak per-page memory drops from `O(page_size × max_payload)` to `O(max_payload)`.
+- **Forward-pass `@odata.nextLink` capture.** Switching from `r.json()` to a forward-pass parser meant `value` and `@odata.nextLink` can no longer be read in arbitrary order. Implementation uses `ijson.parse` (SAX-style events) with a per-row `ObjectBuilder`, so both keys are captured in the same single pass regardless of which Graph endpoint puts which first. Regression test (`test_graph_paged_handles_next_link_before_value`) drives the inverted order explicitly.
+- **Connection-lifetime hygiene.** `graph_paged` wraps each page in `try/finally: r.close()` so an early generator close (caller `break`s out of the loop) releases the underlying urllib3 connection deterministically rather than waiting on GC. `_retrying_request` also closes the discarded response between transient-5xx retries — harmless on the default non-streamed path, required on `stream=True` GETs.
+- **Test-fixture updates.** `FakeResponse` grows `iter_content(chunk_size=...)` (serializes its stored dict on demand) and a no-op `close()`; `FakeGraph.get` accepts the new `stream=` kwarg. No behavior change for the simple-response path — the batch endpoint still consumes `r.json()` and never went through `iter_content`.
 
 ## [1.0.0] — initial release
 

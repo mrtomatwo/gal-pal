@@ -9,4 +9,4 @@ sub-module instead keeps the version readout stdlib-only.
 `pyproject.toml` carries the same version string — keep them in sync.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
